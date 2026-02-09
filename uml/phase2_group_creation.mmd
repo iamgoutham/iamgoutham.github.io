@@ -1,0 +1,128 @@
+%% WhatsApp Group Management Portal
+%% PHASE 2: Group Creation - Semi-Automated
+%% Groups: pending_creation -> link_received -> active
+
+flowchart TD
+    P2_START(["From Phase 1"]):::systemQueue
+    P2_LOAD["Load groups with status = pending_creation"]:::systemQueue
+    P2_QUEUE["Queue template messages for 2000 group admins"]:::systemQueue
+
+    subgraph SEND_BRANCH["Branch A: Send Templates to Admins"]
+        direction TB
+        P2_SEND_TEMPLATE["Send WhatsApp template to admin batch - rate limited"]:::whatsappApi
+        P2_DELIVERED{"Message delivered?"}:::whatsappApi
+        P2_LOG_SENT["Log delivery status: template_sent"]:::whatsappApi
+        P2_RETRY_QUEUE["Add to retry queue"]:::whatsappApi
+        P2_INVALID_PHONE{"Invalid phone number?"}:::whatsappApi
+        P2_FLAG_ADMIN["Flag admin record for manual review"]:::whatsappApi
+        P2_ADMIN_CORRECT["Review and correct admin phone number"]:::portalAdmin
+        P2_RATE_CHECK{"Rate limit hit?"}:::whatsappApi
+        P2_BACKOFF["Apply exponential backoff"]:::whatsappApi
+        P2_WAIT_RETRY["Wait and retry send"]:::whatsappApi
+        P2_RETRY_DELAY["Retry after delay - max 3 attempts"]:::whatsappApi
+        P2_RETRY_OK{"Retry successful?"}:::whatsappApi
+        P2_LOG_SENT2["Log delivery status: template_sent"]:::whatsappApi
+        P2_FLAG_MANUAL["Flag for manual intervention"]:::whatsappApi
+
+        P2_SEND_TEMPLATE --> P2_DELIVERED
+        P2_DELIVERED -->|Yes| P2_LOG_SENT
+        P2_DELIVERED -->|No| P2_RETRY_QUEUE
+        P2_RETRY_QUEUE --> P2_INVALID_PHONE
+        P2_INVALID_PHONE -->|Yes| P2_FLAG_ADMIN
+        P2_FLAG_ADMIN --> P2_ADMIN_CORRECT
+        P2_INVALID_PHONE -->|No| P2_RATE_CHECK
+        P2_RATE_CHECK -->|Yes| P2_BACKOFF
+        P2_BACKOFF --> P2_WAIT_RETRY
+        P2_RATE_CHECK -->|Other error| P2_RETRY_DELAY
+        P2_RETRY_DELAY --> P2_RETRY_OK
+        P2_RETRY_OK -->|Yes| P2_LOG_SENT2
+        P2_RETRY_OK -->|No| P2_FLAG_MANUAL
+    end
+
+    subgraph REMINDER_BRANCH["Branch B: Reminder Scheduler"]
+        direction TB
+        P2_START_REMINDER["Start reminder scheduler for non-responsive admins"]:::systemQueue
+    end
+
+    subgraph ADMIN_RESPONSE["Admin Response Flow"]
+        direction TB
+        P2_ADMIN_RECEIVE["Receive template message on WhatsApp"]:::groupAdmin
+        P2_ADMIN_CREATE["Create WhatsApp group manually"]:::groupAdmin
+        P2_ADMIN_COPY["Copy group invite link"]:::groupAdmin
+        P2_ADMIN_REPLY["Reply with invite link"]:::groupAdmin
+        P2_WEBHOOK["Webhook receives admin reply message"]:::whatsappApi
+        P2_EXTRACT["Extract invite link from message body"]:::whatsappApi
+        P2_VALID_LINK{"Valid invite link format?"}:::whatsappApi
+        P2_STORE_LINK["Store invite link in DB"]:::systemQueue
+        P2_UPDATE_STATUS["Update group: pending_creation to link_received"]:::systemQueue
+        P2_CHECK_ACCESS["Validate link is accessible"]:::systemQueue
+        P2_LINK_ACCESS{"Link is accessible?"}:::systemQueue
+        P2_ACTIVATE["Update group: link_received to active"]:::systemQueue
+        P2_NOTIFY["Notify portal admin of successful creation"]:::systemQueue
+        P2_MARK_INVALID["Mark link as invalid"]:::systemQueue
+        P2_RESEND_MSG["Send to admin: Link appears invalid, please resend"]:::whatsappApi
+        P2_ADMIN_RESEND["Resend correct invite link"]:::groupAdmin
+        P2_CLARIFY["Send clarification: Please reply with valid invite link"]:::whatsappApi
+        P2_ADMIN_REPLY2["Reply with correct link"]:::groupAdmin
+
+        P2_ADMIN_RECEIVE --> P2_ADMIN_CREATE
+        P2_ADMIN_CREATE --> P2_ADMIN_COPY
+        P2_ADMIN_COPY --> P2_ADMIN_REPLY
+        P2_ADMIN_REPLY --> P2_WEBHOOK
+        P2_WEBHOOK --> P2_EXTRACT
+        P2_EXTRACT --> P2_VALID_LINK
+        P2_VALID_LINK -->|Yes| P2_STORE_LINK
+        P2_STORE_LINK --> P2_UPDATE_STATUS
+        P2_UPDATE_STATUS --> P2_CHECK_ACCESS
+        P2_CHECK_ACCESS --> P2_LINK_ACCESS
+        P2_LINK_ACCESS -->|Yes| P2_ACTIVATE
+        P2_ACTIVATE --> P2_NOTIFY
+        P2_LINK_ACCESS -->|No| P2_MARK_INVALID
+        P2_MARK_INVALID --> P2_RESEND_MSG
+        P2_RESEND_MSG --> P2_ADMIN_RESEND
+        P2_VALID_LINK -->|No| P2_CLARIFY
+        P2_CLARIFY --> P2_ADMIN_REPLY2
+    end
+
+    subgraph REMINDER_FLOW["Reminder Flow for Non-Responsive Admins"]
+        direction TB
+        P2_CRON["Cron: Check admins who have not responded"]:::systemQueue
+        P2_ADMIN_RESPONDED{"Admin responded within deadline?"}:::systemQueue
+        P2_CONTINUE(["To Phase 3"]):::systemQueue
+        P2_INC_REMINDER["Increment reminder count"]:::systemQueue
+        P2_REMINDER_MAX{"Reminder count less than max retries?"}:::systemQueue
+        P2_SEND_REMINDER["Send reminder: Please create group and share link"]:::whatsappApi
+        P2_SCHEDULE_NEXT["Schedule next reminder check"]:::systemQueue
+        P2_FLAG_GROUP["Flag group for manual intervention"]:::systemQueue
+        P2_CONTACT_ADMIN["Contact admin directly or reassign group"]:::portalAdmin
+
+        P2_CRON --> P2_ADMIN_RESPONDED
+        P2_ADMIN_RESPONDED -->|Yes| P2_CONTINUE
+        P2_ADMIN_RESPONDED -->|No| P2_INC_REMINDER
+        P2_INC_REMINDER --> P2_REMINDER_MAX
+        P2_REMINDER_MAX -->|Yes| P2_SEND_REMINDER
+        P2_SEND_REMINDER --> P2_SCHEDULE_NEXT
+        P2_REMINDER_MAX -->|Max reached| P2_FLAG_GROUP
+        P2_FLAG_GROUP --> P2_CONTACT_ADMIN
+    end
+
+    P2_START --> P2_LOAD
+    P2_LOAD --> P2_QUEUE
+    P2_QUEUE --> P2_SEND_TEMPLATE
+    P2_QUEUE --> P2_START_REMINDER
+    P2_LOG_SENT --> P2_ADMIN_RECEIVE
+    P2_LOG_SENT2 --> P2_ADMIN_RECEIVE
+    P2_NOTIFY --> P2_CRON
+    P2_ADMIN_RESEND --> P2_WEBHOOK
+    P2_ADMIN_REPLY2 --> P2_WEBHOOK
+
+    %% Note: Template - Please create WhatsApp group group_name and reply with invite link
+    %% Note: Rate ~80 msgs/sec via Meta Cloud API
+    %% Note: Reminder config - Check every 24h, Max reminders 3, Escalation after max
+    %% Note: Admin escalation - Phone call, Email follow-up, Reassign to backup admin
+
+    classDef portalAdmin fill:#ADD8E6,stroke:#4682B4,stroke-width:2px,color:#000
+    classDef systemQueue fill:#90EE90,stroke:#228B22,stroke-width:2px,color:#000
+    classDef whatsappApi fill:#FFFFE0,stroke:#DAA520,stroke-width:2px,color:#000
+    classDef groupAdmin fill:#F08080,stroke:#CD5C5C,stroke-width:2px,color:#000
+    classDef user fill:#E6E6FA,stroke:#9370DB,stroke-width:2px,color:#000
