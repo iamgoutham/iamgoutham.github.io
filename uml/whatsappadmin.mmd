@@ -1,0 +1,561 @@
+
+%% WhatsApp Group Management Portal - Comprehensive Flowchart
+%% Scale: 2000 groups x 50 users = 100,000 users, 2000 admins
+%% Status Transitions:
+%%   Groups: pending_creation -> link_received -> active
+%%   Members: pending -> invite_sent -> reminded -> joined / declined / escalated
+
+flowchart TD
+    %% ============================================================
+    %% PHASE 1: DATA IMPORT & SETUP
+    %% ============================================================
+    subgraph Phase1["PHASE 1: Data Import and Setup"]
+        direction TB
+        P1_START(["Start"]):::portalAdmin
+        P1_UPLOAD["Upload Google Sheet to Portal"]:::portalAdmin
+        P1_PARSE["Parse imported spreadsheet data"]:::systemQueue
+        P1_VALIDATE["Validate data integrity"]:::systemQueue
+        P1_VALID_CHECK{"All records valid?"}:::systemQueue
+        P1_STORE["Store all records in PostgreSQL"]:::systemQueue
+        P1_MARK["Mark all 2000 groups as pending_creation"]:::systemQueue
+        P1_ERROR_REPORT["Generate validation error report"]:::systemQueue
+        P1_FLAG["Flag invalid records for review"]:::systemQueue
+        P1_REVIEW["Review flagged records"]:::portalAdmin
+        P1_FIX_CHECK{"Fix and re-upload?"}:::portalAdmin
+        P1_CANCEL["Cancel import process"]:::portalAdmin
+        P1_CANCEL_STOP(["Stop"]):::portalAdmin
+
+        P1_START --> P1_UPLOAD
+        P1_UPLOAD --> P1_PARSE
+        P1_PARSE --> P1_VALIDATE
+        P1_VALIDATE --> P1_VALID_CHECK
+        P1_VALID_CHECK -->|Yes| P1_STORE
+        P1_STORE --> P1_MARK
+        P1_VALID_CHECK -->|No| P1_ERROR_REPORT
+        P1_ERROR_REPORT --> P1_FLAG
+        P1_FLAG --> P1_REVIEW
+        P1_REVIEW --> P1_FIX_CHECK
+        P1_FIX_CHECK -->|Yes| P1_PARSE
+        P1_FIX_CHECK -->|Abort| P1_CANCEL
+        P1_CANCEL --> P1_CANCEL_STOP
+    end
+
+    %% Note: CSV/Google Sheet contains Group names 2000, Admin phones 2000, Member phones 100000, Group-member assignments
+    %% Note: Validation checks - Phone E.164 format, No duplicates, 1 admin per group, <=50 members, Required fields
+    %% Note: Tables populated - groups status pending_creation, admins, members status pending, group_members
+
+    %% ============================================================
+    %% PHASE 2: GROUP CREATION - SEMI-AUTOMATED
+    %% ============================================================
+    subgraph Phase2["PHASE 2: Group Creation - Semi-Automated"]
+        direction TB
+        P2_LOAD["Load groups with status = pending_creation"]:::systemQueue
+        P2_QUEUE["Queue template messages for 2000 group admins"]:::systemQueue
+
+        subgraph P2_PARALLEL["Parallel: Send Templates and Start Reminders"]
+            direction TB
+            subgraph P2_SEND_BRANCH["Branch A: Send to Admins"]
+                direction TB
+                P2_SEND_TEMPLATE["Send WhatsApp template to admin batch - rate limited"]:::whatsappApi
+                P2_DELIVERED{"Message delivered?"}:::whatsappApi
+                P2_LOG_SENT["Log delivery status: template_sent"]:::whatsappApi
+                P2_RETRY_QUEUE["Add to retry queue"]:::whatsappApi
+                P2_INVALID_PHONE{"Invalid phone number?"}:::whatsappApi
+                P2_FLAG_ADMIN["Flag admin record for manual review"]:::whatsappApi
+                P2_ADMIN_CORRECT["Review and correct admin phone number"]:::portalAdmin
+                P2_RATE_CHECK{"Rate limit hit?"}:::whatsappApi
+                P2_BACKOFF["Apply exponential backoff"]:::whatsappApi
+                P2_WAIT_RETRY["Wait and retry send"]:::whatsappApi
+                P2_RETRY_DELAY["Retry after delay - max 3 attempts"]:::whatsappApi
+                P2_RETRY_OK{"Retry successful?"}:::whatsappApi
+                P2_LOG_SENT2["Log delivery status: template_sent"]:::whatsappApi
+                P2_FLAG_MANUAL["Flag for manual intervention"]:::whatsappApi
+
+                P2_SEND_TEMPLATE --> P2_DELIVERED
+                P2_DELIVERED -->|Yes| P2_LOG_SENT
+                P2_DELIVERED -->|No| P2_RETRY_QUEUE
+                P2_RETRY_QUEUE --> P2_INVALID_PHONE
+                P2_INVALID_PHONE -->|Yes| P2_FLAG_ADMIN
+                P2_FLAG_ADMIN --> P2_ADMIN_CORRECT
+                P2_INVALID_PHONE -->|No| P2_RATE_CHECK
+                P2_RATE_CHECK -->|Yes| P2_BACKOFF
+                P2_BACKOFF --> P2_WAIT_RETRY
+                P2_RATE_CHECK -->|Other error| P2_RETRY_DELAY
+                P2_RETRY_DELAY --> P2_RETRY_OK
+                P2_RETRY_OK -->|Yes| P2_LOG_SENT2
+                P2_RETRY_OK -->|No| P2_FLAG_MANUAL
+            end
+
+            subgraph P2_REMINDER_BRANCH["Branch B: Reminder Scheduler"]
+                direction TB
+                P2_START_REMINDER["Start reminder scheduler for non-responsive admins"]:::systemQueue
+                %% Config: Check every 24h, Max reminders 3, Escalation after max
+            end
+        end
+
+        subgraph P2_ADMIN_RESPONSE["Admin Response Flow"]
+            direction TB
+            P2_ADMIN_RECEIVE["Receive template message on WhatsApp"]:::groupAdmin
+            P2_ADMIN_CREATE["Create WhatsApp group manually"]:::groupAdmin
+            P2_ADMIN_COPY["Copy group invite link"]:::groupAdmin
+            P2_ADMIN_REPLY["Reply with invite link"]:::groupAdmin
+            P2_WEBHOOK["Webhook receives admin reply message"]:::whatsappApi
+            P2_EXTRACT["Extract invite link from message body"]:::whatsappApi
+            P2_VALID_LINK{"Valid invite link format?"}:::whatsappApi
+            P2_STORE_LINK["Store invite link in DB"]:::systemQueue
+            P2_UPDATE_STATUS["Update group: pending_creation to link_received"]:::systemQueue
+            P2_CHECK_ACCESS["Validate link is accessible"]:::systemQueue
+            P2_LINK_ACCESS{"Link is accessible?"}:::systemQueue
+            P2_ACTIVATE["Update group: link_received to active"]:::systemQueue
+            P2_NOTIFY["Notify portal admin of successful creation"]:::systemQueue
+            P2_MARK_INVALID["Mark link as invalid"]:::systemQueue
+            P2_RESEND_MSG["Send to admin: Link appears invalid, please resend"]:::whatsappApi
+            P2_ADMIN_RESEND["Resend correct invite link"]:::groupAdmin
+            P2_CLARIFY["Send clarification: Please reply with valid invite link"]:::whatsappApi
+            P2_ADMIN_REPLY2["Reply with correct link"]:::groupAdmin
+
+            P2_ADMIN_RECEIVE --> P2_ADMIN_CREATE
+            P2_ADMIN_CREATE --> P2_ADMIN_COPY
+            P2_ADMIN_COPY --> P2_ADMIN_REPLY
+            P2_ADMIN_REPLY --> P2_WEBHOOK
+            P2_WEBHOOK --> P2_EXTRACT
+            P2_EXTRACT --> P2_VALID_LINK
+            P2_VALID_LINK -->|Yes| P2_STORE_LINK
+            P2_STORE_LINK --> P2_UPDATE_STATUS
+            P2_UPDATE_STATUS --> P2_CHECK_ACCESS
+            P2_CHECK_ACCESS --> P2_LINK_ACCESS
+            P2_LINK_ACCESS -->|Yes| P2_ACTIVATE
+            P2_ACTIVATE --> P2_NOTIFY
+            P2_LINK_ACCESS -->|No| P2_MARK_INVALID
+            P2_MARK_INVALID --> P2_RESEND_MSG
+            P2_RESEND_MSG --> P2_ADMIN_RESEND
+            P2_VALID_LINK -->|No| P2_CLARIFY
+            P2_CLARIFY --> P2_ADMIN_REPLY2
+        end
+
+        subgraph P2_REMINDER_FLOW["Reminder Flow for Non-Responsive Admins"]
+            direction TB
+            P2_CRON["Cron: Check admins who have not responded"]:::systemQueue
+            P2_ADMIN_RESPONDED{"Admin responded within deadline?"}:::systemQueue
+            P2_CONTINUE["Continue to Phase 3"]:::systemQueue
+            P2_INC_REMINDER["Increment reminder count"]:::systemQueue
+            P2_REMINDER_MAX{"Reminder count less than max retries?"}:::systemQueue
+            P2_SEND_REMINDER["Send reminder: Please create group and share link"]:::whatsappApi
+            P2_SCHEDULE_NEXT["Schedule next reminder check"]:::systemQueue
+            P2_FLAG_GROUP["Flag group for manual intervention"]:::systemQueue
+            P2_CONTACT_ADMIN["Contact admin directly or reassign group"]:::portalAdmin
+
+            P2_CRON --> P2_ADMIN_RESPONDED
+            P2_ADMIN_RESPONDED -->|Yes| P2_CONTINUE
+            P2_ADMIN_RESPONDED -->|No| P2_INC_REMINDER
+            P2_INC_REMINDER --> P2_REMINDER_MAX
+            P2_REMINDER_MAX -->|Yes| P2_SEND_REMINDER
+            P2_SEND_REMINDER --> P2_SCHEDULE_NEXT
+            P2_REMINDER_MAX -->|Max reached| P2_FLAG_GROUP
+            P2_FLAG_GROUP --> P2_CONTACT_ADMIN
+        end
+
+        P2_LOAD --> P2_QUEUE
+        P2_QUEUE --> P2_SEND_TEMPLATE
+        P2_QUEUE --> P2_START_REMINDER
+        P2_LOG_SENT --> P2_ADMIN_RECEIVE
+        P2_LOG_SENT2 --> P2_ADMIN_RECEIVE
+        P2_NOTIFY --> P2_CRON
+        P2_ADMIN_RESEND --> P2_WEBHOOK
+        P2_ADMIN_REPLY2 --> P2_WEBHOOK
+    end
+
+    %% Note: Template - Please create WhatsApp group group_name and reply with invite link
+    %% Note: Rate ~80 msgs/sec via Meta Cloud API
+    %% Note: Admin escalation - Phone call, Email follow-up, Reassign to backup admin
+
+    %% ============================================================
+    %% PHASE 3: USER INVITATIONS - AUTOMATED
+    %% ============================================================
+    subgraph Phase3["PHASE 3: User Invitations - Automated"]
+        direction TB
+        P3_LOAD["Load all groups with status = active"]:::systemQueue
+        P3_LOAD_MEMBERS["For each active group, load assigned members - up to 50 each"]:::systemQueue
+        P3_QUEUE["Queue invite messages for all assigned members"]:::systemQueue
+        %% Note: Total queue up to 100,000 messages at ~80 msgs/sec, ~21 minutes
+
+        subgraph P3_BATCH["Parallel Batch Processing"]
+            direction LR
+            P3_BATCH1["Batch 1: Dequeue messages"]:::systemQueue
+            P3_BATCH2["Batch 2: Dequeue messages"]:::systemQueue
+            P3_BATCHN["Batch N: Dequeue messages"]:::systemQueue
+        end
+
+        P3_PROCESS["Process each queued invite"]:::systemQueue
+        P3_SEND["Send WhatsApp template with group invite link"]:::whatsappApi
+        P3_CHECK["Check send result"]:::whatsappApi
+        P3_SENT_OK{"Message sent successfully?"}:::whatsappApi
+        P3_UPDATE_SENT["Update member: pending to invite_sent"]:::systemQueue
+        P3_LOG_TS["Log timestamp of invite"]:::systemQueue
+        P3_INV_PHONE{"Invalid phone?"}:::systemQueue
+        P3_FLAG_PHONE["Flag member for review: status = invalid_phone"]:::systemQueue
+        P3_RATE_LIMIT{"Rate limit exceeded?"}:::systemQueue
+        P3_PAUSE["Pause sending"]:::systemQueue
+        P3_TOKEN_BUCKET["Apply token bucket backoff algorithm"]:::systemQueue
+        %% Note: Token bucket 80/sec, Backoff exponential, Max wait 5 min, Resume automatically
+        P3_RESUME["Resume after cooldown"]:::systemQueue
+        P3_ADD_RETRY["Add to retry queue"]:::systemQueue
+        P3_INC_RETRY["Increment retry counter"]:::systemQueue
+        P3_RETRY_MAX{"Retries less than max?"}:::systemQueue
+        P3_SCHEDULE_RETRY["Schedule retry with delay"]:::systemQueue
+        P3_MARK_FAILED["Mark as send_failed"]:::systemQueue
+        P3_LOG_FAIL["Log failure reason"]:::systemQueue
+
+        P3_LOAD --> P3_LOAD_MEMBERS
+        P3_LOAD_MEMBERS --> P3_QUEUE
+        P3_QUEUE --> P3_BATCH1
+        P3_QUEUE --> P3_BATCH2
+        P3_QUEUE --> P3_BATCHN
+        P3_BATCH1 --> P3_PROCESS
+        P3_BATCH2 --> P3_PROCESS
+        P3_BATCHN --> P3_PROCESS
+        P3_PROCESS --> P3_SEND
+        P3_SEND --> P3_CHECK
+        P3_CHECK --> P3_SENT_OK
+        P3_SENT_OK -->|Yes| P3_UPDATE_SENT
+        P3_UPDATE_SENT --> P3_LOG_TS
+        P3_SENT_OK -->|No| P3_INV_PHONE
+        P3_INV_PHONE -->|Yes| P3_FLAG_PHONE
+        P3_INV_PHONE -->|No| P3_RATE_LIMIT
+        P3_RATE_LIMIT -->|Yes| P3_PAUSE
+        P3_PAUSE --> P3_TOKEN_BUCKET
+        P3_TOKEN_BUCKET --> P3_RESUME
+        P3_RATE_LIMIT -->|Other failure| P3_ADD_RETRY
+        P3_ADD_RETRY --> P3_INC_RETRY
+        P3_INC_RETRY --> P3_RETRY_MAX
+        P3_RETRY_MAX -->|Yes| P3_SCHEDULE_RETRY
+        P3_RETRY_MAX -->|Max retries| P3_MARK_FAILED
+        P3_MARK_FAILED --> P3_LOG_FAIL
+    end
+
+    %% Note: Template - You are invited to join group_name. Click to join invite_link. Reply YES once joined.
+
+    %% ============================================================
+    %% PHASE 4: JOIN TRACKING - SEMI-AUTOMATED
+    %% ============================================================
+    subgraph Phase4["PHASE 4: Join Tracking - Semi-Automated"]
+        direction TB
+        subgraph P4_OPTION_A["Option A: User Self-Confirmation"]
+            direction TB
+            P4_TRACK["Track incoming user confirmation messages"]:::systemQueue
+            P4_RECEIVE["Receive invite message"]:::user
+            P4_JOIN["Click invite link and join group"]:::user
+            P4_REPLY_YES["Reply YES to confirm"]:::user
+            P4_WEBHOOK_USER["Webhook captures user reply"]:::whatsappApi
+            P4_PARSE["Parse confirmation keyword"]:::whatsappApi
+            P4_CONFIRM{"Reply matches confirmation pattern?"}:::whatsappApi
+            P4_SET_JOINED["Update member: invite_sent to joined"]:::systemQueue
+            P4_RECORD_TS["Record join timestamp"]:::systemQueue
+            P4_DECLINED{"User replied NO or declined?"}:::whatsappApi
+            P4_SET_DECLINED["Update member status to declined"]:::systemQueue
+            P4_LOG_DECLINE["Log decline reason if provided"]:::systemQueue
+            P4_CLARIFY_USER["Send clarification: Reply YES if joined or NO to decline"]:::whatsappApi
+
+            P4_TRACK --> P4_RECEIVE
+            P4_RECEIVE --> P4_JOIN
+            P4_JOIN --> P4_REPLY_YES
+            P4_REPLY_YES --> P4_WEBHOOK_USER
+            P4_WEBHOOK_USER --> P4_PARSE
+            P4_PARSE --> P4_CONFIRM
+            P4_CONFIRM -->|Yes| P4_SET_JOINED
+            P4_SET_JOINED --> P4_RECORD_TS
+            P4_CONFIRM -->|No| P4_DECLINED
+            P4_DECLINED -->|Yes| P4_SET_DECLINED
+            P4_SET_DECLINED --> P4_LOG_DECLINE
+            P4_DECLINED -->|Unrecognized| P4_CLARIFY_USER
+        end
+
+        subgraph P4_OPTION_B["Option B: Admin-Verified Member Count"]
+            direction TB
+            P4_SCHEDULE["Schedule periodic admin verification requests"]:::systemQueue
+            %% Note: Frequency every 48 hours per active group
+            P4_ASK_ADMIN["Send to admin: How many members in group_name? Reply with number"]:::whatsappApi
+            P4_ADMIN_CHECK["Check group member count"]:::groupAdmin
+            P4_ADMIN_REPLY_NUM["Reply with number"]:::groupAdmin
+            P4_WEBHOOK_ADMIN["Webhook captures admin reply"]:::whatsappApi
+            P4_EXTRACT_NUM["Extract numeric count"]:::whatsappApi
+            P4_COMPARE["Compare reported count vs expected members"]:::systemQueue
+            P4_COUNT_MATCH{"Count matches expected?"}:::systemQueue
+            P4_BULK_UPDATE["Bulk-update unconfirmed members to joined"]:::systemQueue
+            P4_FLAG_DISCREPANCY["Flag discrepancy for investigation"]:::systemQueue
+            P4_REVIEW_DISC["Review group membership discrepancy"]:::portalAdmin
+
+            P4_SCHEDULE --> P4_ASK_ADMIN
+            P4_ASK_ADMIN --> P4_ADMIN_CHECK
+            P4_ADMIN_CHECK --> P4_ADMIN_REPLY_NUM
+            P4_ADMIN_REPLY_NUM --> P4_WEBHOOK_ADMIN
+            P4_WEBHOOK_ADMIN --> P4_EXTRACT_NUM
+            P4_EXTRACT_NUM --> P4_COMPARE
+            P4_COMPARE --> P4_COUNT_MATCH
+            P4_COUNT_MATCH -->|Yes| P4_BULK_UPDATE
+            P4_COUNT_MATCH -->|No| P4_FLAG_DISCREPANCY
+            P4_FLAG_DISCREPANCY --> P4_REVIEW_DISC
+        end
+    end
+
+    %% ============================================================
+    %% PHASE 5: REMINDERS AND FOLLOW-UP
+    %% ============================================================
+    subgraph Phase5["PHASE 5: Reminders and Follow-up"]
+        direction TB
+        P5_CRON["Cron job: Scan members with status not joined or declined"]:::systemQueue
+        %% Note: Runs daily, Reminder interval N days, Max reminders M times
+        P5_QUERY["Query members: status IN invite_sent or reminded AND days since contact greater than N"]:::systemQueue
+        P5_FOUND{"Unconfirmed members found?"}:::systemQueue
+        P5_FOREACH["For each unconfirmed member"]:::systemQueue
+        P5_REM_CHECK{"Reminder count less than M?"}:::systemQueue
+        P5_QUEUE_REM["Queue reminder message"]:::systemQueue
+        P5_SEND_REM["Send reminder: Join group_name, Link, Reply YES"]:::whatsappApi
+        P5_SEND_OK{"Send successful?"}:::whatsappApi
+        P5_SET_REMINDED["Update status to reminded"]:::systemQueue
+        P5_INC_REM["Increment reminder count"]:::systemQueue
+        P5_REC_TS["Record reminder timestamp"]:::systemQueue
+        P5_REM_RETRY["Add to retry queue"]:::systemQueue
+        P5_ESCALATE["Update status to escalated"]:::systemQueue
+        P5_TICKET["Create escalation ticket"]:::systemQueue
+        P5_NOTIFY_ADMIN["Notify group admin: Member has not joined after M reminders"]:::whatsappApi
+        P5_REVIEW_ESC["Review escalated members"]:::portalAdmin
+        P5_DECIDE["Decide: remove from assignment or contact manually"]:::portalAdmin
+        P5_ALL_DONE["Log: All members confirmed or escalated"]:::systemQueue
+
+        P5_CRON --> P5_QUERY
+        P5_QUERY --> P5_FOUND
+        P5_FOUND -->|Yes| P5_FOREACH
+        P5_FOREACH --> P5_REM_CHECK
+        P5_REM_CHECK -->|Yes| P5_QUEUE_REM
+        P5_QUEUE_REM --> P5_SEND_REM
+        P5_SEND_REM --> P5_SEND_OK
+        P5_SEND_OK -->|Yes| P5_SET_REMINDED
+        P5_SET_REMINDED --> P5_INC_REM
+        P5_INC_REM --> P5_REC_TS
+        P5_SEND_OK -->|Failed| P5_REM_RETRY
+        P5_REM_CHECK -->|Max reminders reached| P5_ESCALATE
+        P5_ESCALATE --> P5_TICKET
+        P5_TICKET --> P5_NOTIFY_ADMIN
+        P5_NOTIFY_ADMIN --> P5_REVIEW_ESC
+        P5_REVIEW_ESC --> P5_DECIDE
+        P5_FOUND -->|No unconfirmed| P5_ALL_DONE
+    end
+
+    %% ============================================================
+    %% PHASE 6: BULK MESSAGING AND ONGOING OPERATIONS
+    %% ============================================================
+    subgraph Phase6["PHASE 6: Bulk Messaging and Ongoing Operations"]
+        direction TB
+        P6_CREATE["Create new bulk message campaign"]:::portalAdmin
+        %% Note: Compose message, Select target groups, Schedule send time, Set priority
+        P6_SELECT["Select target groups - filter by status, name, etc"]:::portalAdmin
+        P6_PREVIEW["Preview message and recipient count"]:::portalAdmin
+        P6_CONFIRM["Confirm and submit campaign"]:::portalAdmin
+        P6_VALIDATE["Validate campaign parameters"]:::systemQueue
+        P6_CALC["Calculate total recipients"]:::systemQueue
+        P6_CREATE_QUEUE["Create message queue entries"]:::systemQueue
+        %% Note: Queue - Campaign ID, Recipient list, Message template, Scheduled time, Priority weight
+        P6_RATE["Rate limiter: process queue"]:::systemQueue
+
+        subgraph P6_WORKERS["Parallel Workers"]
+            direction LR
+            P6_W1["Worker 1: Dequeue and send"]:::systemQueue
+            P6_W2["Worker 2: Dequeue and send"]:::systemQueue
+            P6_WN["Worker N: Dequeue and send"]:::systemQueue
+        end
+
+        P6_API_SEND["Send messages via Meta Cloud API"]:::whatsappApi
+        %% Note: Rate ~80 msgs/sec, 100K messages ~21 min
+        P6_WEBHOOKS["Receive delivery webhooks"]:::whatsappApi
+        P6_UPDATE_STATUS["Update per-message delivery status"]:::systemQueue
+        %% Note: Statuses - queued, sent, delivered, read, failed
+        P6_FAILURES{"Any failures?"}:::systemQueue
+        P6_ROUTE_RETRY["Route to retry queue"]:::systemQueue
+        P6_APPLY_RETRY["Apply retry logic - same as Phase 3"]:::systemQueue
+        P6_MARK_COMPLETE["Mark campaign as completed"]:::systemQueue
+        P6_VIEW_REPORT["View campaign delivery report"]:::portalAdmin
+
+        P6_CREATE --> P6_SELECT
+        P6_SELECT --> P6_PREVIEW
+        P6_PREVIEW --> P6_CONFIRM
+        P6_CONFIRM --> P6_VALIDATE
+        P6_VALIDATE --> P6_CALC
+        P6_CALC --> P6_CREATE_QUEUE
+        P6_CREATE_QUEUE --> P6_RATE
+        P6_RATE --> P6_W1
+        P6_RATE --> P6_W2
+        P6_RATE --> P6_WN
+        P6_W1 --> P6_API_SEND
+        P6_W2 --> P6_API_SEND
+        P6_WN --> P6_API_SEND
+        P6_API_SEND --> P6_WEBHOOKS
+        P6_WEBHOOKS --> P6_UPDATE_STATUS
+        P6_UPDATE_STATUS --> P6_FAILURES
+        P6_FAILURES -->|Yes| P6_ROUTE_RETRY
+        P6_ROUTE_RETRY --> P6_APPLY_RETRY
+        P6_FAILURES -->|All delivered| P6_MARK_COMPLETE
+        P6_MARK_COMPLETE --> P6_VIEW_REPORT
+        P6_APPLY_RETRY --> P6_VIEW_REPORT
+    end
+
+    %% ============================================================
+    %% PHASE 7: REPORTING AND EXPORT
+    %% ============================================================
+    subgraph Phase7["PHASE 7: Reporting and Export"]
+        direction TB
+        P7_OPEN["Open reporting dashboard"]:::portalAdmin
+
+        subgraph P7_VIEWS["Dashboard Views"]
+            direction LR
+            P7_GROUPS["View: Group Creation Progress"]:::portalAdmin
+            P7_INVITES["View: Invite Statistics"]:::portalAdmin
+            P7_JOINS["View: Join Rates"]:::portalAdmin
+            P7_CAMPAIGNS["View: Campaign Analytics"]:::portalAdmin
+        end
+        %% Note: Group metrics - Total 2000, pending_creation X, link_received Y, active Z, flagged W
+        %% Note: Invite metrics - Total sent, Delivery rate, Failure rate, Pending retries
+        %% Note: Join metrics - Joined N, Declined M, Pending O, Escalated P, Join rate %
+        %% Note: Campaign metrics - Messages sent, Delivered %, Read %, Response rate %
+
+        P7_FILTER["Apply filters - by group, date, status, etc"]:::portalAdmin
+        P7_EXPORT{"Export requested?"}:::portalAdmin
+        P7_FORMAT["Select export format - CSV"]:::portalAdmin
+        P7_GENERATE["Generate filtered data export"]:::portalAdmin
+        P7_DB_QUERY["Query DB with filters"]:::systemQueue
+        P7_STREAM["Stream results to CSV file"]:::systemQueue
+        P7_DOWNLOAD_LINK["Provide download link"]:::systemQueue
+        P7_DOWNLOAD["Download CSV report"]:::portalAdmin
+        P7_CONTINUE["Continue viewing dashboard"]:::portalAdmin
+
+        P7_OPEN --> P7_GROUPS
+        P7_OPEN --> P7_INVITES
+        P7_OPEN --> P7_JOINS
+        P7_OPEN --> P7_CAMPAIGNS
+        P7_GROUPS --> P7_FILTER
+        P7_INVITES --> P7_FILTER
+        P7_JOINS --> P7_FILTER
+        P7_CAMPAIGNS --> P7_FILTER
+        P7_FILTER --> P7_EXPORT
+        P7_EXPORT -->|Yes| P7_FORMAT
+        P7_FORMAT --> P7_GENERATE
+        P7_GENERATE --> P7_DB_QUERY
+        P7_DB_QUERY --> P7_STREAM
+        P7_STREAM --> P7_DOWNLOAD_LINK
+        P7_DOWNLOAD_LINK --> P7_DOWNLOAD
+        P7_EXPORT -->|No| P7_CONTINUE
+    end
+
+    %% ============================================================
+    %% ERROR HANDLING FLOWS - CROSS-CUTTING
+    %% ============================================================
+    subgraph ErrorHandling["Error Handling Flows - Cross-cutting"]
+        direction TB
+        ERR_ROUTER["Error Router receives all system errors"]:::systemQueue
+        ERR_TYPE{"Error type?"}:::systemQueue
+
+        subgraph ERR_MSG_FAIL["Message Send Failure"]
+            direction TB
+            ERR_RETRY_Q["Add to retry queue"]:::systemQueue
+            ERR_EXP_BACK["Apply exponential backoff"]:::systemQueue
+            ERR_RETRY_MAX["Retry up to max attempts"]:::systemQueue
+            ERR_EXHAUSTED{"All retries exhausted?"}:::systemQueue
+            ERR_PERM_FAIL["Mark as permanently_failed"]:::systemQueue
+            ERR_ALERT["Alert portal admin"]:::portalAdmin
+            ERR_SUCCESS["Update status to success"]:::systemQueue
+
+            ERR_RETRY_Q --> ERR_EXP_BACK
+            ERR_EXP_BACK --> ERR_RETRY_MAX
+            ERR_RETRY_MAX --> ERR_EXHAUSTED
+            ERR_EXHAUSTED -->|Yes| ERR_PERM_FAIL
+            ERR_PERM_FAIL --> ERR_ALERT
+            ERR_EXHAUSTED -->|Retry succeeds| ERR_SUCCESS
+        end
+
+        subgraph ERR_PHONE["Invalid Phone"]
+            direction TB
+            ERR_FLAG_PHONE["Flag record: status = invalid_phone"]:::systemQueue
+            ERR_REVIEW_Q["Add to review queue"]:::systemQueue
+            ERR_REVIEW_NUMS["Review invalid numbers"]:::portalAdmin
+            ERR_CORRECT["Correct or remove entry"]:::portalAdmin
+
+            ERR_FLAG_PHONE --> ERR_REVIEW_Q
+            ERR_REVIEW_Q --> ERR_REVIEW_NUMS
+            ERR_REVIEW_NUMS --> ERR_CORRECT
+        end
+
+        subgraph ERR_RATE["Rate Limit 429"]
+            direction TB
+            ERR_PAUSE["Pause all queue workers"]:::systemQueue
+            ERR_READ_HEADER["Read Retry-After header"]:::systemQueue
+            ERR_APPLY_BACK["Apply exponential backoff - min 1s, max 5min"]:::systemQueue
+            ERR_RESUME["Resume processing"]:::systemQueue
+            %% Note: Token bucket - Capacity 80, Refill 80/sec, On 429 drain tokens wait for refill
+
+            ERR_PAUSE --> ERR_READ_HEADER
+            ERR_READ_HEADER --> ERR_APPLY_BACK
+            ERR_APPLY_BACK --> ERR_RESUME
+        end
+
+        subgraph ERR_ADMIN["Admin Unresponsive"]
+            direction TB
+            ERR_CHECK_REM["Check reminder count"]:::systemQueue
+            ERR_REM_MAX{"Count greater than or equal to max?"}:::systemQueue
+            ERR_FLAG_INT["Flag group for manual intervention"]:::systemQueue
+            ERR_REASSIGN["Reassign or contact admin via other channel"]:::portalAdmin
+            ERR_SCHED_REM["Schedule next reminder"]:::systemQueue
+
+            ERR_CHECK_REM --> ERR_REM_MAX
+            ERR_REM_MAX -->|Yes| ERR_FLAG_INT
+            ERR_FLAG_INT --> ERR_REASSIGN
+            ERR_REM_MAX -->|No| ERR_SCHED_REM
+        end
+
+        subgraph ERR_WEBHOOK["Webhook Failure"]
+            direction TB
+            ERR_LOG_WH["Log webhook error"]:::systemQueue
+            ERR_STORE_RAW["Store raw payload for reprocessing"]:::systemQueue
+            ERR_ALERT_SYS["Alert system admin"]:::systemQueue
+
+            ERR_LOG_WH --> ERR_STORE_RAW
+            ERR_STORE_RAW --> ERR_ALERT_SYS
+        end
+
+        ERR_ROUTER --> ERR_TYPE
+        ERR_TYPE -->|msg_send_failure| ERR_RETRY_Q
+        ERR_TYPE -->|invalid_phone| ERR_FLAG_PHONE
+        ERR_TYPE -->|rate_limit_429| ERR_PAUSE
+        ERR_TYPE -->|admin_unresponsive| ERR_CHECK_REM
+        ERR_TYPE -->|webhook_failure| ERR_LOG_WH
+    end
+
+    %% ============================================================
+    %% END
+    %% ============================================================
+    P7_END["System operational - Monitor dashboard for ongoing health"]:::portalAdmin
+    P7_STOP(["Stop"]):::portalAdmin
+
+    %% ============================================================
+    %% PHASE CONNECTIONS
+    %% ============================================================
+    P1_MARK --> P2_LOAD
+    P2_CONTINUE --> P3_LOAD
+    P3_LOG_TS --> P4_TRACK
+    P3_LOG_TS --> P4_SCHEDULE
+    P4_RECORD_TS --> P5_CRON
+    P4_BULK_UPDATE --> P5_CRON
+    P5_REC_TS --> P6_CREATE
+    P5_ALL_DONE --> P6_CREATE
+    P6_VIEW_REPORT --> P7_OPEN
+    P7_DOWNLOAD --> P7_END
+    P7_CONTINUE --> P7_END
+    P7_END --> P7_STOP
+
+    %% ============================================================
+    %% STYLE DEFINITIONS
+    %% ============================================================
+    classDef portalAdmin fill:#ADD8E6,stroke:#4682B4,stroke-width:2px,color:#000
+    classDef systemQueue fill:#90EE90,stroke:#228B22,stroke-width:2px,color:#000
+    classDef whatsappApi fill:#FFFFE0,stroke:#DAA520,stroke-width:2px,color:#000
+    classDef groupAdmin fill:#F08080,stroke:#CD5C5C,stroke-width:2px,color:#000
+    classDef user fill:#E6E6FA,stroke:#9370DB,stroke-width:2px,color:#000
