@@ -1,0 +1,32 @@
+graph TD
+    %% Phase 1: Group Creation
+    subgraph Phase1 [Phase 1: Group Creation - Semi-Automated]
+        A[Google Sheet: 2000 Rows] -->|Ingest| B[(Portal DB)]
+        B --> C{Portal sends WA to Admin}
+        C -->|Request| D[Admin creates group & sends link]
+        D -->|Reply| E[Portal captures & stores link]
+        E --> F[Status: 487/2000 Created]
+    end
+
+    %% Phase 2: User Invitations
+    subgraph Phase2 [Phase 2: User Invitations - Automated]
+        F --> G[For each group with link]
+        G --> H[Portal sends WA to assigned Users]
+        H --> I[Invite Sent Status]
+    end
+
+    %% Phase 3: Tracking
+    subgraph Phase3 [Phase 3: Tracking & Reminders]
+        I --> J{Tracking Strategy}
+        
+        J -->|Option A| K[Ask Admin for member count]
+        J -->|Option B| L[Ask Users: Have you joined?]
+        J -->|Option C| M[Admin uploads screenshot/list]
+        
+        K & L & M --> N[Portal parses & reconciles DB]
+    end
+
+    %% Styling
+    style Phase1 fill:#f9f,stroke:#333,stroke-width:2px
+    style Phase2 fill:#bbf,stroke:#333,stroke-width:2px
+    style Phase3 fill:#bfb,stroke:#333,stroke-width:2px
