@@ -1,0 +1,45 @@
+%% WhatsApp Group Management Portal
+%% PHASE 1: Data Import and Setup
+%% Groups: pending_creation -> link_received -> active
+%% Members: pending -> invite_sent -> reminded -> joined / declined / escalated
+
+flowchart TD
+    P1_START(["Start"]):::portalAdmin
+    P1_UPLOAD["Upload Google Sheet to Portal"]:::portalAdmin
+    P1_PARSE["Parse imported spreadsheet data"]:::systemQueue
+    P1_VALIDATE["Validate data integrity"]:::systemQueue
+    P1_VALID_CHECK{"All records valid?"}:::systemQueue
+    P1_STORE["Store all records in PostgreSQL"]:::systemQueue
+    P1_MARK["Mark all 2000 groups as pending_creation"]:::systemQueue
+    P1_ERROR_REPORT["Generate validation error report"]:::systemQueue
+    P1_FLAG["Flag invalid records for review"]:::systemQueue
+    P1_REVIEW["Review flagged records"]:::portalAdmin
+    P1_FIX_CHECK{"Fix and re-upload?"}:::portalAdmin
+    P1_CANCEL["Cancel import process"]:::portalAdmin
+    P1_CANCEL_STOP(["Stop"]):::portalAdmin
+    P1_DONE(["To Phase 2"]):::systemQueue
+
+    P1_START --> P1_UPLOAD
+    P1_UPLOAD --> P1_PARSE
+    P1_PARSE --> P1_VALIDATE
+    P1_VALIDATE --> P1_VALID_CHECK
+    P1_VALID_CHECK -->|Yes| P1_STORE
+    P1_STORE --> P1_MARK
+    P1_MARK --> P1_DONE
+    P1_VALID_CHECK -->|No| P1_ERROR_REPORT
+    P1_ERROR_REPORT --> P1_FLAG
+    P1_FLAG --> P1_REVIEW
+    P1_REVIEW --> P1_FIX_CHECK
+    P1_FIX_CHECK -->|Yes| P1_PARSE
+    P1_FIX_CHECK -->|Abort| P1_CANCEL
+    P1_CANCEL --> P1_CANCEL_STOP
+
+    %% Note: CSV/Google Sheet contains Group names 2000, Admin phones 2000, Member phones 100000, Group-member assignments
+    %% Note: Validation checks - Phone E.164 format, No duplicates, 1 admin per group, <=50 members, Required fields
+    %% Note: Tables populated - groups status pending_creation, admins, members status pending, group_members
+
+    classDef portalAdmin fill:#ADD8E6,stroke:#4682B4,stroke-width:2px,color:#000
+    classDef systemQueue fill:#90EE90,stroke:#228B22,stroke-width:2px,color:#000
+    classDef whatsappApi fill:#FFFFE0,stroke:#DAA520,stroke-width:2px,color:#000
+    classDef groupAdmin fill:#F08080,stroke:#CD5C5C,stroke-width:2px,color:#000
+    classDef user fill:#E6E6FA,stroke:#9370DB,stroke-width:2px,color:#000
